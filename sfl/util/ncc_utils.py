@@ -2,9 +2,82 @@ import jax
 import jax.numpy as jnp
 from flax.struct import dataclass
 import optax
-import optax.tree_utils as otu
+import chex
+from optax._src import numerics
+
 
 from functools import partial
+import operator
+
+"""THE FOLLOWING IS JUST COPIED FROM OPTAX TREE UTILS"""
+
+def tree_sum(tree) -> chex.Numeric:
+  """Compute the sum of all the elements in a pytree.
+
+  Args:
+    tree: pytree.
+
+  Returns:
+    a scalar value.
+  """
+  sums = jax.tree_util.tree_map(jnp.sum, tree)
+  return jax.tree_util.tree_reduce(operator.add, sums, initializer=0)
+
+def _square(leaf):
+  return jnp.square(leaf.real) + jnp.square(leaf.imag)
+
+def tree_l2_norm(tree, squared: bool = False) -> chex.Numeric:
+  """Compute the l2 norm of a pytree.
+
+  Args:
+    tree: pytree.
+    squared: whether the norm should be returned squared or not.
+
+  Returns:
+    a scalar value.
+  """
+  squared_tree = jax.tree_util.tree_map(_square, tree)
+  sqnorm = tree_sum(squared_tree)
+  if squared:
+    return sqnorm
+  else:
+    return jnp.sqrt(sqnorm)
+
+def tree_update_moment(updates, moments, decay, order):
+  """Compute the exponential moving average of the `order`-th moment."""
+  return jax.tree_util.tree_map(
+      lambda g, t: (
+          (1 - decay) * (g**order) + decay * t if g is not None else None
+      ),
+      updates,
+      moments,
+      is_leaf=lambda x: x is None,
+  )
+
+def tree_update_moment_per_elem_norm(updates, moments, decay, order):
+  """Compute the EMA of the `order`-th moment of the element-wise norm."""
+
+  def orderth_norm(g):
+    if jnp.isrealobj(g):
+      return g**order
+    else:
+      half_order = order / 2
+      # JAX generates different HLO for int and float `order`
+      if half_order.is_integer():
+        half_order = int(half_order)
+      return numerics.abs_sq(g) ** half_order
+
+  return jax.tree_util.tree_map(
+      lambda g, t: (
+          (1 - decay) * orderth_norm(g) + decay * t if g is not None else None
+      ),
+      updates,
+      moments,
+      is_leaf=lambda x: x is None,
+  )
+
+
+
 @dataclass
 class ScaleByTiAdaState:
     vx: float | None
@@ -40,15 +113,15 @@ def scale_x_by_ti_ada_noadam(
     
     def update_fn(x_updates, state, params=None):
 
-        vx = state.vx + otu.tree_l2_norm(x_updates, squared=True)
+        vx = state.vx + tree_l2_norm(x_updates, squared=True)
         coord_vx = jax.tree_util.tree_map(
             lambda prev, curr: prev + jnp.square(curr), state.coord_vx, x_updates
         )
         
-        global_coeff = eta * jnp.pow(vx, alpha) / jnp.pow(jnp.maximum(vx, state.vy) + 1e-6, alpha)
+        global_coeff = eta * jax.lax.pow(vx, alpha) / jax.lax.pow(jnp.maximum(vx, state.vy) + 1e-6, alpha)
         
         grad = jax.tree_util.tree_map(
-            lambda g, c:  g * global_coeff * jnp.pow(c + 1e-6, -alpha), x_updates, coord_vx
+            lambda g, c:  g * global_coeff * jax.lax.pow(c + 1e-6, -alpha), x_updates, coord_vx
         )
 
         state = ScaleByTiAdaNoAdamState(
@@ -78,7 +151,7 @@ def scale_y_by_ti_ada_noadam(
         vy = state.vy + jnp.square(jnp.linalg.norm(updates))
         coord_vy = state.coord_vy + jnp.square(updates)
 
-        coeff = eta / jnp.pow(coord_vy + 1e-6, beta)
+        coeff = eta / jax.lax.pow(coord_vy + 1e-6, beta)
 
         grad = coeff * updates
 
@@ -113,19 +186,19 @@ def scale_x_by_ti_ada(
     
     def update_fn(x_updates, state, params=None):
 
-        grad = otu.tree_update_moment(x_updates, state.prev_grad, b1, 1)
-        vx = otu.tree_update_moment_per_elem_norm(x_updates, state.vx, b2, 2)
+        grad = tree_update_moment(x_updates, state.prev_grad, b1, 1)
+        vx = tree_update_moment_per_elem_norm(x_updates, state.vx, b2, 2)
         
         exp_b1 = state.exp_b1 * b1
         exp_b2 = state.exp_b2 * b2
 
-        total_sum_vx = optax.tree_utils.tree_sum(vx)
+        total_sum_vx = tree_sum(vx)
         total_sum_vy = state.vy.sum()
 
-        ratio = jnp.pow(total_sum_vx, alpha) / jnp.pow(jax.lax.max(total_sum_vx, total_sum_vy), alpha)
+        ratio = jax.lax.pow(total_sum_vx, alpha) / jax.lax.pow(jax.lax.max(total_sum_vx, total_sum_vy), alpha)
 
         coeff = jax.tree_util.tree_map(
-            lambda v: eta / (jnp.pow(v, alpha) / jnp.sqrt(1 - exp_b2) + eps), vx
+            lambda v: eta / (jax.lax.pow(v, alpha) / jnp.sqrt(1 - exp_b2) + eps), vx
         )
 
         bias_corrected_grad = jax.tree_util.tree_map(lambda m: m / (1 - exp_b1), grad)
@@ -165,13 +238,13 @@ def scale_y_by_ti_ada(
     
     def update_fn(y_updates, state, params=None):
 
-        grad = otu.tree_update_moment(y_updates, state.prev_grad, b1, 1)
-        vy = otu.tree_update_moment_per_elem_norm(y_updates, state.vy, b2, 2)
+        grad = tree_update_moment(y_updates, state.prev_grad, b1, 1)
+        vy = tree_update_moment_per_elem_norm(y_updates, state.vy, b2, 2)
         
         exp_b1 = state.exp_b1 * b1
         exp_b2 = state.exp_b2 * b2
 
-        coeff = eta / (jnp.pow(vy, beta) / jnp.sqrt(1 - exp_b2) + eps)
+        coeff = eta / (jax.lax.pow(vy, beta) / jnp.sqrt(1 - exp_b2) + eps)
 
         bias_corrected_grad = grad / (1 - exp_b1)
         
@@ -200,7 +273,7 @@ def ti_ada(
 ):
     return optax.chain(
         scale_x_by_ti_ada(vx0, vy0, 1.0, alpha, b1, b2, eps),
-        optax.scale_by_learning_rate(eta) 
+        optax.scale(-eta) if isinstance(eta, float) else optax.scale_by_schedule(lambda t: -eta(t)) 
     )
 
 def ti_ada_sgd(
@@ -209,7 +282,7 @@ def ti_ada_sgd(
 ):
     return optax.chain(
         scale_x_by_ti_ada_noadam(1.0, alpha),
-        optax.scale_by_learning_rate(eta)
+        optax.scale(-eta) if isinstance(eta, float) else optax.scale_by_schedule(lambda t: -eta(t))
     )
     
 def projection_simplex_truncated(x: jnp.ndarray, eps: float) -> jnp.ndarray: 

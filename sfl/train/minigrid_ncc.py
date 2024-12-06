@@ -27,7 +27,7 @@ from jaxued.environments.underspecified_env import EnvParams, EnvState, Observat
 from jaxued.linen import ResetRNN
 from jaxued.environments import Maze, MazeRenderer
 from jaxued.environments.maze import Level, make_level_generator, make_level_mutator_minimax
-from jaxued.level_sampler import BaseLevelSampler
+from jaxued.level_sampler import LevelSampler as BaseLevelSampler
 from jaxued.utils import compute_max_returns, max_mc, positive_value_loss
 from jaxued.wrappers import AutoReplayWrapper
 
@@ -40,15 +40,44 @@ from sfl.train.minigrid_plr import (
     update_actor_critic_rnn,
     ActorCritic,
     setup_checkpointing,
-    train_state_to_log_dict,
     compute_score
 )
 from sfl.util.ncc_utils import scale_y_by_ti_ada, ScaleByTiAdaState, ti_ada, projection_simplex_truncated
 
+def train_state_to_log_dict(train_state, level_sampler) -> dict:
+    """To prevent the entire (large) train_state to be copied to the CPU when doing logging, this function returns all of the important information in a dictionary format.
+
+        Anything in the `log` key will be logged to wandb.
+    
+    Args:
+        train_state (TrainState): 
+        level_sampler (LevelSampler): 
+
+    Returns:
+        dict: 
+    """
+    sampler = train_state.sampler
+    idx = jnp.arange(level_sampler.capacity) < sampler["size"]
+    s = jnp.maximum(idx.sum(), 1)
+    return {
+        "log":{
+            "level_sampler/size": sampler["size"],
+            "level_sampler/episode_count": sampler["episode_count"],
+            "level_sampler/max_score": sampler["scores"].max(),
+            "level_sampler/weighted_score": (sampler["scores"] * level_sampler.level_weights(sampler)).sum(),
+            "level_sampler/mean_score": (sampler["scores"] * idx).sum() / s,
+        },
+        "info": {
+            "num_dr_updates": 0.0,
+            "num_replay_updates": 0.0,
+            "num_mutation_updates": 0.0,
+        }
+    }
+
 class LevelSampler(BaseLevelSampler):
 
     def level_weights(self, sampler, *args,**kwargs):
-        return sampler.scores
+        return sampler["scores"]
     
     def initialize(self, pholder_level, pholder_level_extra):
         sampler = {
@@ -68,6 +97,8 @@ class TrainState(BaseTrainState):
 
 @hydra.main(version_base=None, config_path="config", config_name="minigrid-ncc")
 def main(config):
+
+    config = OmegaConf.to_container(config)
 
     d = {}
     for k, v in config.items():
@@ -91,15 +122,10 @@ def main(config):
     )
 
     def log_eval(stats, train_state_info):
-        print(f"Logging update: {stats['update_count']}")
+        print(f"Logging update")
         
         # generic stats
-        env_steps = stats["update_count"] * config["NUM_ENVS"] * config["NUM_STEPS"]
-        log_dict = {
-            "num_updates": stats["update_count"],
-            "num_env_steps": env_steps,
-            "sps": env_steps / stats['time_delta'],
-        }
+        log_dict = {}
         
         # evaluation performance
         solve_rates = stats['eval_solve_rates']
@@ -180,7 +206,9 @@ def main(config):
         max_returns = compute_max_returns(dones, rewards)
         new_level_scores = compute_score(config, dones, values, max_returns, advantages)
 
-        sampler, _ = level_sampler.insert_batch(sampler.replace(scores = old_level_scores), new_levels, new_level_scores, {"max_return": max_returns})
+        update_sampler = {**train_state.sampler,"scores": old_level_scores}
+
+        sampler, _ = level_sampler.insert_batch(update_sampler, new_levels, new_level_scores, {"max_return": max_returns})
         
         return sampler
 
@@ -227,10 +255,8 @@ def main(config):
 
         rng, train_state, xhat, prev_grad, y_opt_state = carry
 
-        sampler = train_state.sampler.replace(
-            score = projection_simplex_truncated(xhat + prev_grad, config["META_TRUNC"]) if config["META_OPTISMISTIC"] else xhat
-        )
-            
+        new_score = projection_simplex_truncated(xhat + prev_grad, config["META_TRUNC"]) if config["META_OPTIMISTIC"] else xhat
+        sampler = {**train_state.sampler, "scores": new_score}
         # Collect trajectories on replay levels
         rng, rng_levels, rng_reset = jax.random.split(rng, 3)
         sampler, (level_inds, levels) = level_sampler.sample_replay_levels(sampler, rng_levels, config["NUM_ENVS"])
@@ -268,14 +294,15 @@ def main(config):
         )
         
         # Update the level sampler
-        # Collect trajectories on replay levels
         rng, rng_levels, rng_reset = jax.random.split(rng, 3)
-        sampler, (level_inds, levels) = level_sampler.sample_replay_levels(sampler, rng_levels, config["NUM_ENVS"])
 
         level_inds = jnp.arange(config["PLR_PARAMS"]["capacity"])
+        # levels = jax.tree_util.tree_map(
+        #     lambda x: jnp.repeat(x, 5, axis=0), sampler["levels"]
+        # )
         levels = sampler["levels"]
         
-        init_obs, init_env_state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(jax.random.split(rng_reset, config["NUM_ENVS"]), levels, env_params)
+        init_obs, init_env_state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(jax.random.split(rng_reset, config["PLR_PARAMS"]["capacity"]), levels, env_params)
         (
             (rng, train_state, _, _, _, last_value),
             (obs, actions, rewards, dones, log_probs, values, info),
@@ -284,10 +311,10 @@ def main(config):
             env,
             env_params,
             train_state,
-            ActorCritic.initialize_carry((config["NUM_ENVS"],)),
+            ActorCritic.initialize_carry((config["PLR_PARAMS"]["capacity"],)),
             init_obs,
             init_env_state,
-            config["NUM_ENVS"],
+            config["PLR_PARAMS"]["capacity"],
             config["NUM_STEPS"],
         )
         advantages, targets = compute_gae(config["GAMMA"], config["GAE_LAMBDA"], last_value, values, rewards, dones)
@@ -295,12 +322,12 @@ def main(config):
         
         scores = compute_score(config, dones, values, max_returns, advantages)
 
-        grad, y_opt_state = ti_ada.update(scores, y_opt_state)
+        grad, y_opt_state = y_ti_ada.update(scores, y_opt_state)
 
         xhat = projection_simplex_truncated(xhat + grad, config["META_TRUNC"])
 
         rng, _rng = jax.random.split(rng)
-        sampler = replace_fn(_rng, train_state, scores)
+        sampler = {**replace_fn(_rng, train_state, scores), "scores": new_score}
                         
         metrics = {
             "losses": jax.tree_map(lambda x: x.mean(), losses),
@@ -362,12 +389,11 @@ def main(config):
         images = jax.vmap(jax.vmap(env_renderer.render_state, (0, None)), (0, None))(states, env_params) # (num_steps, num_eval_levels, ...)
         frames = images.transpose(0, 1, 4, 2, 3) # WandB expects color channel before image dimensions when dealing with animations for some reason
         
-        metrics["update_count"] = train_state.num_dr_updates + train_state.num_replay_updates + train_state.num_mutation_updates
         metrics["eval_returns"] = eval_returns
         metrics["eval_solve_rates"] = eval_solve_rates
         metrics["eval_ep_lengths"]  = episode_lengths
         metrics["eval_animation"] = (frames, episode_lengths)
-        metrics["replay_levels"] = jax.vmap(env_renderer.render_level, (0, None))(train_state.replay_last_level_batch, env_params)
+        # metrics["replay_levels"] = jax.vmap(env_renderer.render_level, (0, None))(train_state.replay_last_level_batch, env_params)
          
         highest_scoring_level = level_sampler.get_levels(train_state.sampler, train_state.sampler["scores"].argmax())
         highest_weighted_level = level_sampler.get_levels(train_state.sampler, level_sampler.level_weights(train_state.sampler).argmax())
@@ -408,7 +434,7 @@ def main(config):
     train_state = create_train_state(rng_init)
 
     # Set up y optimizer state
-    y_ti_ada = scale_y_by_ti_ada(eta=config["Y_LR"])
+    y_ti_ada = scale_y_by_ti_ada(eta=config["META_LR"])
     y_opt_state = y_ti_ada.init(jnp.zeros_like(train_state.sampler["scores"]))
         
     xhat = grad = jnp.zeros_like(train_state.sampler["scores"])
