@@ -191,6 +191,7 @@ def main(config):
         project=config["PROJECT"],
         config=config,
         mode=config["WANDB_MODE"],
+        reinit=True
     )
 
     def log_eval(stats, train_state_info):
