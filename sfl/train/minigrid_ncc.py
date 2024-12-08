@@ -35,7 +35,7 @@ from sfl.util.jaxued.jaxued_utils import l1_value_loss
 from sfl.train.train_utils import save_params
 from sfl.train.minigrid_plr import (
     compute_gae,
-    sample_trajectories_rnn,
+    TrainState,
     evaluate_rnn,
     update_actor_critic_rnn,
     ActorCritic,
@@ -43,6 +43,78 @@ from sfl.train.minigrid_plr import (
     compute_score
 )
 from sfl.util.ncc_utils import scale_y_by_ti_ada, ScaleByTiAdaState, ti_ada, projection_simplex_truncated
+
+def sample_trajectories_rnn(
+    rng: chex.PRNGKey,
+    env: UnderspecifiedEnv,
+    env_params: EnvParams,
+    train_state: TrainState,
+    init_hstate: chex.ArrayTree,
+    init_obs: Observation,
+    init_env_state: EnvState,
+    num_envs: int,
+    max_episode_length: int,
+    gamma: float = 1.0
+) -> Tuple[Tuple[chex.PRNGKey, TrainState, chex.ArrayTree, Observation, EnvState, chex.Array], Tuple[Observation, chex.Array, chex.Array, chex.Array, chex.Array, chex.Array, dict]]:
+    """This samples trajectories from the environment using the agent specified by the `train_state`.
+
+    Args:
+
+        rng (chex.PRNGKey): Singleton 
+        env (UnderspecifiedEnv): 
+        env_params (EnvParams): 
+        train_state (TrainState): Singleton
+        init_hstate (chex.ArrayTree): This is the init RNN hidden state, has to have shape (NUM_ENVS, ...)
+        init_obs (Observation): The initial observation, shape (NUM_ENVS, ...)
+        init_env_state (EnvState): The initial env state (NUM_ENVS, ...)
+        num_envs (int): The number of envs that are vmapped over.
+        max_episode_length (int): The maximum episode length, i.e., the number of steps to do the rollouts for.
+
+    Returns:
+        Tuple[Tuple[chex.PRNGKey, TrainState, chex.ArrayTree, Observation, EnvState, chex.Array], Tuple[Observation, chex.Array, chex.Array, chex.Array, chex.Array, chex.Array, dict]]: (rng, train_state, hstate, last_obs, last_env_state, last_value), traj, where traj is (obs, action, reward, done, log_prob, value, info). The first element in the tuple consists of arrays that have shapes (NUM_ENVS, ...) (except `rng` and and `train_state` which are singleton). The second element in the tuple is of shape (NUM_STEPS, NUM_ENVS, ...), and it contains the trajectory.
+    """
+    def sample_step(carry, _):
+        rng, train_state, hstate, obs, env_state, disc_return, disc_factor, last_done = carry
+        rng, rng_action, rng_step = jax.random.split(rng, 3)
+
+        x = jax.tree_map(lambda x: x[None, ...], (obs, last_done))
+        hstate, pi, value = train_state.apply_fn(train_state.params, x, hstate)
+        action = pi.sample(seed=rng_action)
+        log_prob = pi.log_prob(action)
+        value, action, log_prob = (
+            value.squeeze(0),
+            action.squeeze(0),
+            log_prob.squeeze(0),
+        )
+
+        next_obs, env_state, reward, done, info = jax.vmap(
+            env.step, in_axes=(0, 0, 0, None)
+        )(jax.random.split(rng_step, num_envs), env_state, action, env_params)
+
+        disc_factor *= gamma
+        carry = (rng, train_state, hstate, next_obs, env_state, disc_return + disc_factor * reward, disc_factor, done)
+        return carry, (obs, action, reward, done, log_prob, value, info)
+
+    (rng, train_state, hstate, last_obs, last_env_state, disc_return, _, last_done), traj = jax.lax.scan(
+        sample_step,
+        (
+            rng,
+            train_state,
+            init_hstate,
+            init_obs,
+            init_env_state,
+            jnp.zeros(num_envs, dtype=float),
+            1.0,
+            jnp.zeros(num_envs, dtype=bool),
+        ),
+        None,
+        length=max_episode_length,
+    )
+
+    x = jax.tree_map(lambda x: x[None, ...], (last_obs, last_done))
+    _, _, last_value = train_state.apply_fn(train_state.params, x, hstate)
+
+    return (rng, train_state, hstate, last_obs, last_env_state, last_value.squeeze(0), disc_return), traj
 
 def train_state_to_log_dict(train_state, level_sampler) -> dict:
     """To prevent the entire (large) train_state to be copied to the CPU when doing logging, this function returns all of the important information in a dictionary format.
@@ -162,7 +234,6 @@ def main(config):
     env_renderer = MazeRenderer(env, tile_size=8)
     env = AutoReplayWrapper(env)
     env_params = env.default_params
-    mutate_level = make_level_mutator_minimax(100)
 
     # And the level sampler    
     # TODO: maybe need to subclass the LevelSampler to get rid of staleness and such
@@ -176,7 +247,37 @@ def main(config):
         duplicate_check=config["PLR_PARAMS"]['duplicate_check'],
     )
 
-    @jax.jit
+    def learnability_fn(rng, levels, num_envs, train_state):
+        def rollout_fn(rng):
+
+            # Get the scores of the levels
+            rng, _rng = jax.random.split(rng)
+            init_obs, init_env_state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(jax.random.split(_rng, num_envs), levels, env_params)
+            # Rollout
+            (
+                (rng, _, hstate, last_obs, last_env_state, last_value, disc_return),
+                (obs, actions, rewards, dones, log_probs, values, info),
+            ) = sample_trajectories_rnn(
+                rng,
+                env,
+                env_params,
+                train_state,
+                ActorCritic.initialize_carry((num_envs,)),
+                init_obs,
+                init_env_state,
+                num_envs,
+                config["NUM_STEPS"],
+                config["GAMMA"]
+            )
+            return disc_return > 0, disc_return
+        
+        rng, _rng = jax.random.split(rng)
+        successes, returns = jax.vmap(rollout_fn)(jax.random.split(_rng, config["EVAL_NUM_ATTEMPTS"]))
+        p = successes.mean(axis=0)
+        new_level_scores = p * (1 - p)
+
+        return new_level_scores, returns.max(axis=0)
+
     def replace_fn(rng, train_state, old_level_scores):
         # NOTE: scores here are the actual UED scores, NOT the probabilities induced by the projection
 
@@ -184,27 +285,8 @@ def main(config):
         rng, _rng = jax.random.split(rng)
         new_levels = jax.vmap(sample_random_level)(jax.random.split(_rng, config["NUM_ENVS"]))
 
-        # Get the scores of the levels
         rng, _rng = jax.random.split(rng)
-        init_obs, init_env_state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(jax.random.split(_rng, config["NUM_ENVS"]), new_levels, env_params)
-        # Rollout
-        (
-            (rng, train_state, hstate, last_obs, last_env_state, last_value),
-            (obs, actions, rewards, dones, log_probs, values, info),
-        ) = sample_trajectories_rnn(
-            rng,
-            env,
-            env_params,
-            train_state,
-            ActorCritic.initialize_carry((config["NUM_ENVS"],)),
-            init_obs,
-            init_env_state,
-            config["NUM_ENVS"],
-            config["NUM_STEPS"],
-        )
-        advantages, targets = compute_gae(config["GAMMA"], config["GAE_LAMBDA"], last_value, values, rewards, dones)
-        max_returns = compute_max_returns(dones, rewards)
-        new_level_scores = compute_score(config, dones, values, max_returns, advantages)
+        new_level_scores, max_returns = learnability_fn(_rng, new_levels, config["NUM_ENVS"], train_state)
 
         update_sampler = {**train_state.sampler,"scores": old_level_scores}
 
@@ -262,7 +344,7 @@ def main(config):
         sampler, (level_inds, levels) = level_sampler.sample_replay_levels(sampler, rng_levels, config["NUM_ENVS"])
         init_obs, init_env_state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(jax.random.split(rng_reset, config["NUM_ENVS"]), levels, env_params)
         (
-            (rng, train_state, hstate, last_obs, last_env_state, last_value),
+            (rng, train_state, hstate, last_obs, last_env_state, last_value, disc_return),
             (obs, actions, rewards, dones, log_probs, values, info),
         ) = sample_trajectories_rnn(
             rng,
@@ -274,6 +356,7 @@ def main(config):
             init_env_state,
             config["NUM_ENVS"],
             config["NUM_STEPS"],
+            config["GAMMA"]
         )
         advantages, targets = compute_gae(config["GAMMA"], config["GAE_LAMBDA"], last_value, values, rewards, dones)
         
@@ -294,45 +377,22 @@ def main(config):
         )
         
         # Update the level sampler
-        rng, rng_levels, rng_reset = jax.random.split(rng, 3)
-
-        level_inds = jnp.arange(config["PLR_PARAMS"]["capacity"])
-        # levels = jax.tree_util.tree_map(
-        #     lambda x: jnp.repeat(x, 5, axis=0), sampler["levels"]
-        # )
         levels = sampler["levels"]
-        
-        init_obs, init_env_state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(jax.random.split(rng_reset, config["PLR_PARAMS"]["capacity"]), levels, env_params)
-        (
-            (rng, train_state, _, _, _, last_value),
-            (obs, actions, rewards, dones, log_probs, values, info),
-        ) = sample_trajectories_rnn(
-            rng,
-            env,
-            env_params,
-            train_state,
-            ActorCritic.initialize_carry((config["PLR_PARAMS"]["capacity"],)),
-            init_obs,
-            init_env_state,
-            config["PLR_PARAMS"]["capacity"],
-            config["NUM_STEPS"],
-        )
-        advantages, targets = compute_gae(config["GAMMA"], config["GAE_LAMBDA"], last_value, values, rewards, dones)
-        max_returns = jnp.maximum(level_sampler.get_levels_extra(sampler, level_inds)["max_return"], compute_max_returns(dones, rewards))
-        
-        scores = compute_score(config, dones, values, max_returns, advantages)
-
-        grad, y_opt_state = y_ti_ada.update(scores, y_opt_state)
-
-        xhat = projection_simplex_truncated(xhat + grad, config["META_TRUNC"])
+        rng, _rng = jax.random.split(rng)
+        scores, _ = learnability_fn(_rng, levels, config["PLR_PARAMS"]["capacity"], train_state)
 
         rng, _rng = jax.random.split(rng)
-        sampler = {**replace_fn(_rng, train_state, scores), "scores": new_score}
-                        
+        new_sampler = replace_fn(_rng, train_state, scores)
+        sampler = {**new_sampler, "scores": new_score}
+
+        grad, y_opt_state = y_ti_ada.update(new_sampler["scores"], y_opt_state)
+        xhat = projection_simplex_truncated(xhat + grad, config["META_TRUNC"])
+
         metrics = {
             "losses": jax.tree_map(lambda x: x.mean(), losses),
             "mean_num_blocks": levels.wall_map.sum() / config["NUM_ENVS"],
             "meta_entropy": -jnp.dot(sampler["scores"], jnp.log(sampler["scores"] + 1e-6)),
+            "meta_loss": new_sampler["scores"].T @ new_score
         }
         
         train_state = train_state.replace(
