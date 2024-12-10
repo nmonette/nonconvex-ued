@@ -1,8 +1,9 @@
+name: sfl_seed_sweep
 command:
   - python3
   - ${program}
   - ${args_no_hyphens}
-entity: alex-plus
+entity: flair
 method: grid
 metric:
   goal: maximize
@@ -29,4 +30,4 @@ parameters:
 
 
 program: sfl/train/minigrid_sfl.py
-project: minigrid
+project: tiada_hyperparams_sweep

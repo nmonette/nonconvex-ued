@@ -151,16 +151,16 @@ class LevelSampler(BaseLevelSampler):
     def level_weights(self, sampler, *args,**kwargs):
         return sampler["scores"]
     
-    def initialize(self, pholder_level, pholder_level_extra):
+    def initialize(self, levels, level_extras):
         sampler = {
-                "levels": jax.tree_map(lambda x: jnp.array([x]).repeat(self.capacity, axis=0), pholder_level),
+                "levels": levels,
                 "scores": jnp.full(self.capacity, 1 / self.capacity, dtype=jnp.float32),
                 "timestamps": jnp.zeros(self.capacity, dtype=jnp.int32),
-                "size": 0,
+                "size": self.capacity,
                 "episode_count": 0,
         }
-        if pholder_level_extra is not None:
-            sampler["levels_extra"] = jax.tree_map(lambda x: jnp.array([x]).repeat(self.capacity, axis=0), pholder_level_extra)
+        if level_extras is not None:
+            sampler["levels_extra"] = level_extras
         return sampler
 
 
@@ -289,6 +289,13 @@ def main(config):
         rng, _rng = jax.random.split(rng)
         new_level_scores, max_returns = learnability_fn(_rng, new_levels, config["NUM_ENVS"], train_state)
 
+        idxs = jnp.flipud(jnp.argsort(new_level_scores))
+
+        new_levels = jax.tree_util.tree_map(
+            lambda x: x[idxs], new_levels
+        )
+        new_level_scores = new_level_scores[idxs]
+
         update_sampler = {**train_state.sampler,"scores": old_level_scores}
 
         sampler, _ = level_sampler.insert_batch(update_sampler, new_levels, new_level_scores, {"max_return": max_returns})
@@ -325,8 +332,9 @@ def main(config):
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 ti_ada(vy0 = jnp.zeros(config["PLR_PARAMS"]["capacity"]), eta=linear_schedule),
             )
-        pholder_level = sample_random_level(jax.random.PRNGKey(0))
-        sampler = level_sampler.initialize(pholder_level, {"max_return": -jnp.inf})
+        rng, _rng = jax.random.split(rng)
+        init_levels = jax.vmap(sample_random_level)(jax.random.split(_rng, config["PLR_PARAMS"]["capacity"]))
+        sampler = level_sampler.initialize(init_levels, {"max_return": jnp.full(config["PLR_PARAMS"]["capacity"], -jnp.inf)})
         return TrainState.create(
             apply_fn=network.apply,
             params=network_params,

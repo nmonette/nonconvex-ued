@@ -185,7 +185,6 @@ class EvalSingletonsRunner:
              done, 
              ep_done,
              info) = step
-            print('info', info)
             ep_stats = self._update_ep_stats(ep_stats, ep_done, jax.tree_map(lambda x: x.sum(axis=-1), info), 1) 
         
             return (next_state, next_obs, done, next_carry, ep_stats), (obs, state, reward, done, ep_done, info)

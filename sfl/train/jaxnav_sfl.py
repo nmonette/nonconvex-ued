@@ -241,11 +241,12 @@ def main(config):
                     timeo = jnp.sum(info["TimeO"] * mask)
                     l = end_idx - start_idx
                     return r, success, collision, timeo, l
-                
+            
+            
                 done_idxs = jnp.argwhere(dones, size=10, fill_value=max_steps).squeeze()
                 mask_done = jnp.where(done_idxs == max_steps, 0, 1)
                 ep_return, success, collision, timeo, length = __ep_outcomes(jnp.concatenate([jnp.array([-1]), done_idxs[:-1]]), done_idxs)        
-                        
+
                 return {"ep_return": ep_return.mean(where=mask_done),
                         "num_episodes": mask_done.sum(),
                         "success_rate": success.mean(where=mask_done),
@@ -280,6 +281,7 @@ def main(config):
             print('done_by_env', done_by_env.shape)
             print('reward_by_env', reward_by_env.shape)
             print('info_by_actor', info_by_actor)
+            print("shapes", jax.tree_map(jnp.shape, traj_batch))
             o = _calc_outcomes_by_agent(config["ROLLOUT_STEPS"], traj_batch.done, traj_batch.reward, info_by_actor)
             print('o', o)
             success_by_env = o["success_rate"].reshape((env.num_agents, config["BATCH_SIZE"]))

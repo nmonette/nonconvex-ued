@@ -80,7 +80,6 @@ class EvalSampledRunner:
             env_init_obs, env_init_states = jax.vmap(self.env.reset, in_axes=0)(jax.random.split(rng, self.n_envs))
         
         self.n_parallel = n_episodes * self.n_envs        
-        print(n_episodes, self.n_envs, self.n_parallel, 'pararasdas')
         if self.is_minigrid:
             self.num_actors = self.n_parallel
         else:
@@ -137,7 +136,6 @@ class EvalSampledRunner:
                 done[np.newaxis, :],
             )
         if self.is_minigrid:
-            print("shape here", done.shape, obs.image.shape)
             carry, pi, _ = self.network.apply(params, ac_in, carry)
             carry = jax.tree_map(lambda x: x.squeeze(), carry)
         else:
@@ -238,8 +236,6 @@ class EvalSampledRunner:
             rngs,
             length=n_steps)
         
-        print("MIke shape", done.shape, traj[2].shape, traj[2].sum())
-
         return ep_stats, traj
 
     @partial(jax.jit, static_argnums=(0,))
@@ -367,7 +363,6 @@ class EvalSampledRunner:
         # ep_dones_by_env = ep_dones.swapaxes(0, 1).reshape((-1, self.n_envs, self.n_episodes))
         
         threads = []
-        print('obs shape', obs['agent_0'].shape)
         for i in range(self.n_envs):
             if o_by_env["success_rate"][i] == 1.0 and viz_only_failure:
                 continue
@@ -526,7 +521,6 @@ class EvalSampledRunnerMinigrid(EvalSampledRunner):
                 im = viz.render_state(state, self.env.default_params)
                 ax.imshow(im)
             
-            print('num states', len(state_list))
             ani = FuncAnimation(
                 fig,
                 render_step,

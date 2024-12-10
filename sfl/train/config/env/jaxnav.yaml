@@ -1,6 +1,6 @@
 env_name: "jaxnav"
-test_set: "multi"
-num_agents: 4
+test_set: "single" # multi vs. single
+num_agents: 1
 env_params: 
   act_type: "Continuous"  # Continuous, Discrete
   rad: 0.3  # agent radius (m)
