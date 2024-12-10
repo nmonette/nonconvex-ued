@@ -5,9 +5,9 @@ defaults:
 
 "SEED": 2
 "GROUP_NAME": "jaxnav-sfl"
-"ENTITY": ""
-"PROJECT": "multi_robot_ued"
-"WANDB_MODE" : "disabled"
+"ENTITY": "nathanmonette1"
+"PROJECT": "minigrid"
+"WANDB_MODE" : "online"
 "SAVE_PATH": "checkpoints/multi_robot_ued"
 
 env:

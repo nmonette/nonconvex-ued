@@ -6,8 +6,8 @@ defaults:
 
 "SEED": 2
 "GROUP_NAME": "jaxnav-plr"
-"ENTITY": ""
+"ENTITY": "nathanmonette1"
 "PROJECT": "multi_robot_ued"
-"WANDB_MODE" : "disabled"
+"WANDB_MODE" : "online"
 "SAVE_PATH": "checkpoints/multi_robot_ued"
-"EVAL_SAMPLED_SET_PATH": "sfl/data/test_sets/sampled_tc_100e_4a.pkl"
+"EVAL_SAMPLED_SET_PATH": "sfl/data/test_sets/sampled_tc_100e_1a.pkl"

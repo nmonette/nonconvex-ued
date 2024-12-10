@@ -474,43 +474,14 @@ def main(config):
                 t_config["GAMMA"]
             )
 
-            return traj_batch, jax.tree_map(lambda x: x.swapaxes(2, 1).reshape((-1, num_envs * env.num_agents)), traj_batch.info)
-        
-        @partial(jax.vmap, in_axes=(None, 2, 2, 2))
-        @partial(jax.jit, static_argnums=(0,))
-        def _calc_outcomes_by_agent(max_steps: int, dones, returns, info):
-            idxs = jnp.arange(max_steps)
-            
-            @partial(jax.vmap, in_axes=(0, 0))
-            def __ep_outcomes(start_idx, end_idx): 
-                mask = (idxs > start_idx) & (idxs <= end_idx) & (end_idx != max_steps)
-                r = jnp.sum(returns * mask)
-                success = jnp.sum(info["GoalR"] * mask)
-                collision = jnp.sum((info["MapC"] + info["AgentC"]) * mask)
-                timeo = jnp.sum(info["TimeO"] * mask)
-                l = end_idx - start_idx
-                return r, success, collision, timeo, l
-    
-            done_idxs = dones.argmax(axis=1)
-            mask_done = jnp.where(done_idxs == max_steps - 1, 0, 1)
-            ep_return, success, collision, timeo, length = __ep_outcomes(jnp.concatenate([jnp.array([-1]), done_idxs[:-1]]), done_idxs)        
-                    
-            return {"ep_return": ep_return.mean(where=mask_done),
-                    "num_episodes": mask_done.sum(),
-                    "success_rate": success.mean(where=mask_done),
-                    "collision_rate": collision.mean(where=mask_done),
-                    "timeout_rate": timeo.mean(where=mask_done),
-                    "ep_len": length.mean(where=mask_done),
-                    }
+            return traj_batch, disc_return
 
         rng, _rng = jax.random.split(rng)
-        traj_batch, info_by_actor = jax.vmap(rollout_fn)(jax.random.split(rng, 10))
+        traj_batch, disc_return = jax.vmap(rollout_fn)(jax.random.split(rng, 10))
+    
+        p = (traj_batch.info["GoalR"] == 1).any(axis=1).mean(axis=0).sum(axis=-1)
         
-        o = _calc_outcomes_by_agent(env.max_steps, traj_batch.done, traj_batch.reward, info_by_actor)
-        success_by_env = o["success_rate"].reshape((env.num_agents, num_envs))
-        learnability_by_env = (success_by_env * (1 - success_by_env)).sum(axis=0)
-        
-        return learnability_by_env, o["ep_return"]
+        return p * (1 - p), disc_return.max(axis=0).squeeze()
 
     def replace_fn(rng, train_state, old_level_scores):
         # NOTE: scores here are the actual UED scores, NOT the probabilities induced by the projection

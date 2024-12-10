@@ -1,0 +1,34 @@
+command:
+  - python3
+  - ${program}
+  - ${args_no_hyphens}
+entity: flair
+method: random
+metric:
+  goal: maximize
+  name: win_rate
+parameters:
+  SEED:
+    values:
+      - 0
+      - 1
+      - 2
+      - 3
+  WANDB_MODE:
+    values:
+      - "online"
+  GROUP_NAME:
+    values:
+      - "minigrid-ncc-10seeds"
+  META_LR: 
+    distribution: uniform
+    min: 0.00001
+    max: 0.01
+  LR: 
+    distribution: uniform
+    min: 0.00001
+    max: 0.002
+
+
+program: sfl/train/minigrid_ncc.py
+project: tiada_hyperparams_sweep
