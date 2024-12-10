@@ -1,6 +1,6 @@
 "LR": 0.0014658280281033783
 "NUM_ENVS": 256
-"NUM_STEPS": 512
+"NUM_STEPS": 500
 "TOTAL_TIMESTEPS": 3e8
 "EVAL_TIMESTEPS": 2.5e7  # TODO move to just using eval freq (as it's used by plr)
 "EVAL_FREQ": 50

@@ -490,12 +490,11 @@ def main(config):
                 timeo = jnp.sum(info["TimeO"] * mask)
                 l = end_idx - start_idx
                 return r, success, collision, timeo, l
-            
-            done_idxs = jnp.argmax(dones, axis=1)
-            mask_done = jnp.where(done_idxs == max_steps, 0, 1)
+    
+            done_idxs = dones.argmax(axis=1)
+            mask_done = jnp.where(done_idxs == max_steps - 1, 0, 1)
             ep_return, success, collision, timeo, length = __ep_outcomes(jnp.concatenate([jnp.array([-1]), done_idxs[:-1]]), done_idxs)        
                     
-            jax.debug.breakpoint()
             return {"ep_return": ep_return.mean(where=mask_done),
                     "num_episodes": mask_done.sum(),
                     "success_rate": success.mean(where=mask_done),
@@ -507,7 +506,7 @@ def main(config):
         rng, _rng = jax.random.split(rng)
         traj_batch, info_by_actor = jax.vmap(rollout_fn)(jax.random.split(rng, 10))
         
-        o = _calc_outcomes_by_agent(t_config["NUM_STEPS"], traj_batch.done, traj_batch.reward, info_by_actor)
+        o = _calc_outcomes_by_agent(env.max_steps, traj_batch.done, traj_batch.reward, info_by_actor)
         success_by_env = o["success_rate"].reshape((env.num_agents, num_envs))
         learnability_by_env = (success_by_env * (1 - success_by_env)).sum(axis=0)
         
