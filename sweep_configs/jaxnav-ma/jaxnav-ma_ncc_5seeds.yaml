@@ -25,6 +25,6 @@ parameters:
     values:
       - "online"
 
-program: sfl/train/jaxnav_sfl.py
+program: sfl/train/jaxnav_ncc.py
 project: tiada_hyperparams_sweep
-name: jaxnav_multi_sfl_seeds
+name: jaxnav_multi_tiada_seeds

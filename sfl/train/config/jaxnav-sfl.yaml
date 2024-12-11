@@ -24,4 +24,4 @@ learning:
 "NUM_BATCHES": 5
 "ROLLOUT_STEPS": 1000
 "NUM_TO_SAVE": 100
-"EVAL_SAMPLED_SET_PATH": "sfl/data/test_sets/sampled_tc_100e_1a.pkl"
+"EVAL_SAMPLED_SET_PATH": "sfl/data/test_sets/sampled_tc_100e_4a.pkl"

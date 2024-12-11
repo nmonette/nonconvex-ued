@@ -466,7 +466,7 @@ def main(config):
                 _rng,
                 env,
                 train_state,
-                ScannedRNN.initialize_carry(num_envs, t_config["HIDDEN_SIZE"]),
+                ScannedRNN.initialize_carry(num_envs * env.num_agents, t_config["HIDDEN_SIZE"]),
                 init_obs,
                 init_env_state,
                 t_config,
@@ -481,7 +481,7 @@ def main(config):
     
         p = (traj_batch.info["GoalR"] == 1).any(axis=1).mean(axis=0).sum(axis=-1)
         
-        return p * (1 - p), disc_return.max(axis=0).squeeze()
+        return p * (1 - p), disc_return.max(axis=0).max(axis=0)
 
     def replace_fn(rng, train_state, old_level_scores):
         # NOTE: scores here are the actual UED scores, NOT the probabilities induced by the projection

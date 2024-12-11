@@ -205,6 +205,7 @@ def sample_trajectories_rnn(
             obs_batch[np.newaxis, :],
             last_done[np.newaxis, :],
         )
+        print(jax.tree_util.tree_map(jnp.shape, ac_in))
         hstate, pi, value, dormancy = train_state.apply_fn(train_state.params, hstate, ac_in)
         action = pi.sample(seed=_rng)
         log_prob = pi.log_prob(action)

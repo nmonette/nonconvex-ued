@@ -10,8 +10,8 @@ defaults:
 "PROJECT": "minigrid"
 "WANDB_MODE" : "online"
 "SAVE_PATH": "checkpoints/multi_robot_ued"
-"EVAL_SAMPLED_SET_PATH": "sfl/data/test_sets/sampled_tc_100e_1a.pkl" # change to 4a for multiagent
-"META_LR": 0.006880119088674936
-"META_TRUNC": 1e-5
+"EVAL_SAMPLED_SET_PATH": "sfl/data/test_sets/sampled_tc_100e_4a.pkl" # change to 4a for multiagent
+"META_LR": 0.00125
+"META_TRUNC": 1e-4
 "META_OPTIMISTIC": True
 "OPTIMISTIC": False

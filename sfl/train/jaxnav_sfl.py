@@ -281,7 +281,6 @@ def main(config):
             print('done_by_env', done_by_env.shape)
             print('reward_by_env', reward_by_env.shape)
             print('info_by_actor', info_by_actor)
-            print("shapes", jax.tree_map(jnp.shape, traj_batch))
             o = _calc_outcomes_by_agent(config["ROLLOUT_STEPS"], traj_batch.done, traj_batch.reward, info_by_actor)
             print('o', o)
             success_by_env = o["success_rate"].reshape((env.num_agents, config["BATCH_SIZE"]))
