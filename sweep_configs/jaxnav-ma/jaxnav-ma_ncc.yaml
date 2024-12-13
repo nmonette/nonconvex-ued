@@ -1,0 +1,49 @@
+command:
+  - python3
+  - ${program}
+  - ${args_no_hyphens}
+entity: flair
+method: random
+metric:
+  goal: maximize
+  name: win_rate
+parameters:
+  env.num_agents:
+    values:
+      - 4
+  env.test_set:
+    values:
+      - "multi"
+  SEED:
+    values:
+      - 0
+      - 1
+      - 2
+      - 3
+  WANDB_MODE:
+    values:
+      - "online"
+  GROUP_NAME:
+    values:
+      - "jaxnav-ma-ncc-hyperparam"
+  META_LR: 
+    distribution: uniform
+    min: 0.00001
+    max: 0.01
+  learning.LR: 
+    distribution: uniform
+    min: 0.00001
+    max: 0.002
+  OPTIMISTIC:
+    values:
+      - True
+      - False
+  META_OPTIMISTIC:
+    values:
+      - True
+      - False
+
+
+program: sfl/train/jaxnav_ncc_every_n.py
+project: tiada_hyperparams_sweep
+name: tiada_hyperparams_sweep_ma_jaxnav

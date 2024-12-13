@@ -24,6 +24,15 @@ parameters:
   WANDB_MODE:
     values:
       - "online"
+  OPTIMISTIC:
+    values:
+      - true
+  learning.LR:
+    values:
+      - 0.0002977383607431826
+  META_LR: 
+    values: 
+      - 0.003096954219472177
 
 program: sfl/train/jaxnav_ncc.py
 project: tiada_hyperparams_sweep

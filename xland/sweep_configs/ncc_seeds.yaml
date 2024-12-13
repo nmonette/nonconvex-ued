@@ -23,8 +23,8 @@ parameters:
       - high-3m
   group:
     values:
-      - high-13-sfl-v1
-program: training/train_meta_task_sfl.py
+      - high-13-ncc-v1
+program: training/train_meta_task_ncc.py
 project: minigrid
 
 
