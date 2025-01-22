@@ -273,62 +273,73 @@ def ppo_update_networks(
     ent_coef: float,
     stackelberg_coef: float,
 ):
-    # NORMALIZE ADVANTAGES
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
     def _loss_fn(params):
-        # RERUN NETWORK
-        dist, value, _ = train_state.apply_fn(
-            params,
-            {
-                # [batch_size, seq_len, ...]
-                "observation": transitions.obs,
-                "prev_action": transitions.prev_action,
-                "prev_reward": transitions.prev_reward,
-            },
-            init_hstate,
+
+        def inner(transitions, init_hstate, advantages, targets):
+
+            # NORMALIZE ADVANTAGES
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+            # RERUN NETWORK
+            dist, value, _ = train_state.apply_fn(
+                params,
+                {
+                    # [batch_size, seq_len, ...]
+                    "observation": transitions.obs,
+                    "prev_action": transitions.prev_action,
+                    "prev_reward": transitions.prev_reward,
+                },
+                init_hstate,
+            )
+            log_prob = dist.log_prob(transitions.action)
+
+            # CALCULATE VALUE LOSS
+            value_pred_clipped = transitions.value + (value - transitions.value).clip(-clip_eps, clip_eps)
+            value_loss = jnp.square(value - targets)
+            value_loss_clipped = jnp.square(value_pred_clipped - targets)
+            value_loss = 0.5 * jnp.maximum(value_loss, value_loss_clipped).mean()
+            # TODO: ablate this!
+            # value_loss = jnp.square(value - targets).mean()
+
+            # CALCULATE ACTOR LOSS
+            ratio = jnp.exp(log_prob - transitions.log_prob)
+            actor_loss1 = advantages * ratio
+            actor_loss2 = advantages * jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
+            actor_loss_nomean = -jnp.minimum(actor_loss1, actor_loss2)
+            actor_loss = actor_loss_nomean.mean()
+            entropy = dist.entropy().mean()
+
+            total_loss = actor_loss + vf_coef * value_loss - ent_coef * entropy
+
+            # CALCULATE STACKELBERG GRADIENT TERM
+
+            # NOTE: UNCOMMENT for REINFORCE regularizer
+            # score_grad = (2 * targets * targets * log_prob).mean() - 2 * targets.mean() * (targets * log_prob).mean()
+            # total_loss = total_loss - 2 * score_grad * targets.mean()
+            # wandb run `stackelberg-run` had `(2 * targets * log_prob)` and is missing the second `targets`
+            
+            # NOTE: UNCOMMENT foR PPO regularizer
+            # score_grad = (2 * advantages * actor_loss_nomean).mean() - 2 * advantages.mean() * actor_loss
+            # total_loss = total_loss - 2 * score_grad * advantages.mean()
+
+            # NOTE: UNCOMMENT for sign-fixed PPO regularizer
+            # score_grad = (2 * advantages * -actor_loss_nomean).mean() - 2 * advantages.mean() * -actor_loss
+            # total_loss = total_loss - stackelberg_coef * score_grad * advantages.mean()
+
+            score_grad = (2 * (advantages - advantages.mean()) * (-actor_loss_nomean + actor_loss)).mean() * advantages.mean()
+            total_loss = total_loss - stackelberg_coef * score_grad
+            return total_loss, (value_loss, actor_loss, entropy, score_grad)
+
+        loss, (vloss, aloss, entropy, reg) = jax.tree_util.tree_map(
+            lambda x: x.mean(axis=0), jax.vmap(inner)(transitions, init_hstate, advantages, targets)
         )
-        log_prob = dist.log_prob(transitions.action)
 
-        # CALCULATE VALUE LOSS
-        value_pred_clipped = transitions.value + (value - transitions.value).clip(-clip_eps, clip_eps)
-        value_loss = jnp.square(value - targets)
-        value_loss_clipped = jnp.square(value_pred_clipped - targets)
-        value_loss = 0.5 * jnp.maximum(value_loss, value_loss_clipped).mean()
-        # TODO: ablate this!
-        # value_loss = jnp.square(value - targets).mean()
-
-        # CALCULATE ACTOR LOSS
-        ratio = jnp.exp(log_prob - transitions.log_prob)
-        actor_loss1 = advantages * ratio
-        actor_loss2 = advantages * jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
-        actor_loss_nomean = -jnp.minimum(actor_loss1, actor_loss2)
-        actor_loss = actor_loss_nomean.mean()
-        entropy = dist.entropy().mean()
-
-        total_loss = actor_loss + vf_coef * value_loss - ent_coef * entropy
-
-        # CALCULATE STACKELBERG GRADIENT TERM
-
-        # NOTE: UNCOMMENT for REINFORCE regularizer
-        # score_grad = (2 * targets * targets * log_prob).mean() - 2 * targets.mean() * (targets * log_prob).mean()
-        # total_loss = total_loss + stackelberg_coef * score_grad * targets.mean()
-        # wandb run `stackelberg-run` had `(2 * targets * log_prob)` and is missing the second `targets`
-        score_grad = ((2 * targets * targets * log_prob) - (2 * targets.mean() * (log_prob * targets).mean())) * targets
-        total_loss = total_loss - stackelberg_coef * score_grad.mean()
-        # NOTE: UNCOMMENT foR PPO regularizer
-        # score_grad = (2 * advantages * actor_loss_nomean).mean() - 2 * advantages.mean() * actor_loss
-        # total_loss = total_loss - 2 * score_grad * advantages.mean()
-
-        # NOTE: UNCOMMENT for sign-fixed PPO regularizer
-        # score_grad = (2 * advantages * -actor_loss_nomean).mean() - 2 * advantages.mean() * -actor_loss
-        # score_grad = ((2 * advantages * -actor_loss_nomean) - (2 * advantages.mean() * -actor_loss)) * advantages
-        # total_loss = total_loss - stackelberg_coef * score_grad.mean()
-
-        return total_loss, (value_loss, actor_loss, entropy, score_grad.mean())
+        return loss, (vloss, aloss, entropy, reg)
 
     (loss, (vloss, aloss, entropy, reg)), grads = jax.value_and_grad(_loss_fn, has_aux=True)(train_state.params)
-    (loss, vloss, aloss, entropy, grads) = jax.lax.pmean((loss, vloss, aloss, entropy, grads), axis_name="devices")
+
+    (loss, vloss, aloss, entropy, reg, grads) = jax.lax.pmean((loss, vloss, aloss, entropy, reg, grads), axis_name="devices")
+    
     train_state = train_state.apply_gradients(grads=grads)
     update_info = {
         "total_loss": loss,
@@ -339,6 +350,7 @@ def ppo_update_networks(
     }
     return train_state, update_info
 
+NUM_ENVS_PER_LEVEL = 4
 
 def make_train(
     env: Environment,
@@ -423,7 +435,6 @@ def make_train(
 
             # UNCOMMENT for Return-Variance
             scores = returns.var(axis=0)
-
             return scores, returns.max(axis=0)
 
         def replace_fn(rng, train_state, old_level_scores):
@@ -458,11 +469,12 @@ def make_train(
             rng, _rng1, _rng2, _rng3 = jax.random.split(rng, num=4)
             
             # sample rulesets for this meta update
-            branch = level_sampler.sample_replay_decision(train_state.sampler, _rng1).astype(int)
             new_score = projection_simplex_truncated(xhat + prev_grad, config.meta_trunc) if config.meta_optimistic else xhat
             sampler = {**train_state.sampler, "scores": new_score}
             rng, _rng = jax.random.split(rng)
-            sampler, (level_idxs, rulesets) = level_sampler.sample_replay_levels(sampler, _rng, config.num_envs_per_device)
+            sampler, (level_idxs, rulesets) = level_sampler.sample_replay_levels(sampler, _rng, config.num_envs_per_device // NUM_ENVS_PER_LEVEL)
+
+            rulesets = jax.tree_util.tree_map(lambda x: jnp.repeat(x, NUM_ENVS_PER_LEVEL, axis=0), rulesets)
 
             meta_env_params = env_params.replace(ruleset=rulesets)
 
@@ -541,7 +553,7 @@ def make_train(
                         new_train_state, update_info = ppo_update_networks(
                             train_state=train_state,
                             transitions=transitions,
-                            init_hstate=init_hstate.squeeze(1),
+                            init_hstate=init_hstate.squeeze(3),
                             advantages=advantages,
                             targets=targets,
                             clip_eps=config.clip_eps,
@@ -555,17 +567,20 @@ def make_train(
 
                     # MINIBATCHES PREPARATION
                     rng, _rng = jax.random.split(rng)
-                    permutation = jax.random.permutation(_rng, config.num_envs_per_device)
+                    permutation = jax.random.choice(_rng, jnp.arange(0, config.num_envs_per_device, step=NUM_ENVS_PER_LEVEL), shape=(config.num_envs_per_device // NUM_ENVS_PER_LEVEL, ), replace=False)
                     # [seq_len, batch_size, ...]
                     batch = (init_hstate, transitions, advantages, targets)
                     # [batch_size, seq_len, ...], as our model assumes
                     batch = jtu.tree_map(lambda x: x.swapaxes(0, 1), batch)
 
-                    shuffled_batch = jtu.tree_map(lambda x: jnp.take(x, permutation, axis=0), batch)
+                    take_fn = jax.vmap(lambda x, idx: x[jnp.arange(NUM_ENVS_PER_LEVEL) + idx], in_axes=(None, 0))
+                    shuffled_batch = jtu.tree_map(lambda x: take_fn(x, permutation), batch)
+
                     # [num_minibatches, minibatch_size, ...]
                     minibatches = jtu.tree_map(
                         lambda x: jnp.reshape(x, (config.num_minibatches, -1) + x.shape[1:]), shuffled_batch
                     )
+
                     train_state, update_info = jax.lax.scan(_update_minbatch, train_state, minibatches)
 
                     update_state = (rng, train_state, init_hstate, transitions, advantages, targets)
