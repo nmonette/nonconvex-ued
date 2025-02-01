@@ -377,7 +377,7 @@ def make_train(
             
             # sample rulesets for this meta update
             branch = level_sampler.sample_replay_decision(train_state.sampler, _rng1).astype(int)
-            new_score = projection_simplex_truncated(xhat + prev_grad, config.meta_trunc) if config.meta_optimistic else xhat
+            new_score = xhat # projection_simplex_truncated(xhat + prev_grad, config.meta_trunc) if config.meta_optimistic else xhat
             sampler = {**train_state.sampler, "scores": new_score}
             rng, _rng = jax.random.split(rng)
             sampler, (level_idxs, rulesets) = level_sampler.sample_replay_levels(sampler, _rng, config.num_envs_per_device)
@@ -524,10 +524,17 @@ def make_train(
             sampler = {**new_sampler, "scores": new_score}
 
             # grad_fn = lambda y: new_sampler["scores"] # 
-            grad_fn = jax.grad(lambda y: y.T @ new_sampler["scores"] - 0.001 * jnp.log(y + 1e-6).T @ y)
+            grad_fn = jax.grad(lambda y: y.T @ new_sampler["scores"] - 0.05 * jnp.log(y + 1e-6).T @ y)
 
-            grad, y_opt_state = y_ti_ada.update(grad_fn(new_score), y_opt_state)
-            xhat = projection_simplex_truncated(xhat + grad, config.meta_trunc)
+            def adv_loop(carry, _):
+                y, y_opt_state = carry
+
+                grad, y_opt_state = y_ti_ada.update(grad_fn(y), y_opt_state)
+                y = projection_simplex_truncated(y + grad, config.meta_trunc)
+
+                return (y, y_opt_state), None
+
+            (xhat, y_opt_state), _ = jax.lax.scan(adv_loop, (jnp.full_like(xhat, 1 / len(xhat)), y_opt_state), None, length=1000)
 
             train_state = train_state.replace(
                 opt_state = jax.tree_util.tree_map(
