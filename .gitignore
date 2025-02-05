@@ -160,6 +160,8 @@ cython_debug/
 #.idea/
 #
 # wandb
+.netrc
+pygrun
 wandb/
 artifacts/
 outputs/
