@@ -84,7 +84,7 @@ class TrainConfig:
     num_steps_per_update: int = 32
     update_epochs: int = 1
     num_minibatches: int = 16
-    total_timesteps: int = 1e10
+    total_timesteps: int = 5.7e9
     learning_rate: float = 0.0001
     clip_eps: float = 0.2
     gamma: float = 0.99
