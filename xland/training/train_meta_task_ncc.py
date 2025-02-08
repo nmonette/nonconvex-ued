@@ -72,6 +72,7 @@ class TrainConfig:
     meta_optimistic: bool = True
     meta_trunc: float = 1e-5
     meta_lr: float = 1e-3
+    meta_entr_coeff: float = 0.005
 
     action_emb_dim: int = 16
     rnn_hidden_dim: int = 1024
@@ -99,6 +100,7 @@ class TrainConfig:
     train_seed: int = 42
     checkpoint_path: Optional[str] = "checkpoints"
     #ued
+    static_buffer: bool = False
     exploratory_grad_updates: bool = True
     ued_score_function: str = "MaxMC"
     replay_prob: float = 0.95
