@@ -2,7 +2,7 @@ command:
   - python3
   - ${program}
   - ${args}
-entity: alex-plus
+entity: flair
 method: grid
 metric:
   goal: maximize
@@ -35,5 +35,6 @@ parameters:
   mode:
     values:
       - online
+name: xland-dr
 program: training/train_meta_task.py
 project: minigrid

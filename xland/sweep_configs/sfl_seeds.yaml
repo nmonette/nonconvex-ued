@@ -32,6 +32,7 @@ parameters:
   group:
     values:
       - high-13-ncc-v1
+name: xland-sfl
 program: training/train_meta_task_sfl.py
 project: minigrid
 
