@@ -72,7 +72,6 @@ class TrainConfig:
     meta_optimistic: bool = True
     meta_trunc: float = 1e-5
     meta_lr: float = 1e-3
-    meta_entr_coeff: float = 0.005
 
     action_emb_dim: int = 16
     rnn_hidden_dim: int = 1024
@@ -519,16 +518,11 @@ def make_train(
             scores, _ = learnability_fn(_rng, levels, config.buffer_capacity, train_state)
 
             rng, _rng = jax.random.split(rng)
-            # new_sampler = jax.lax.cond(
-            #     update_idx % config.replace_iters == 0, replace_fn, lambda r, t, s: train_state.sampler, _rng, train_state, scores
-            # )
-            new_sampler = {**train_state.sampler, "scores": scores} if config.static_buffer else replace_fn(_rng, train_state, scores)
+
+            new_sampler  = {**train_state.sampler, "scores": scores} if config.static_buffer else replace_fn(_rng, train_state, scores)
             sampler = {**new_sampler, "scores": new_score}
 
-            # grad_fn = lambda y: new_sampler["scores"] # 
-            grad_fn = jax.grad(lambda y: y.T @ new_sampler["scores"] - config.meta_entr_coeff * jnp.log(y + 1e-6).T @ y)
-
-            grad, y_opt_state = y_ti_ada.update(grad_fn(new_score), y_opt_state)
+            grad, y_opt_state = y_ti_ada.update(new_sampler["scores"], y_opt_state)
             xhat = projection_simplex_truncated(xhat + grad, config.meta_trunc)
 
             train_state = train_state.replace(
@@ -578,8 +572,6 @@ def make_train(
                     "eval/success_rate_mean": jnp.mean(eval_stats.success/eval_stats.episodes),
                     "eval/lengths_20percentile": jnp.percentile(eval_stats.length, q=20),
                     "eval/returns_20percentile": jnp.percentile(eval_stats.reward, q=20),
-                    "adv_entropy": -jnp.log(new_score + 1e-6).T @ new_score,
-                    "adv_loss": new_score.T @ new_sampler["scores"] - 0.01 * jnp.log(new_score + 1e-6).T @ new_score,
                     "ruleset_mean_num_rules": ruleset_mean_num_rules,
                     "outcomes": success_rate,
                     "num_env_steps": update_idx * config.num_inner_updates * config.num_steps_per_update * config.num_envs,
