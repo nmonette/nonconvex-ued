@@ -11,6 +11,9 @@ parameters:
   mode:
     values:
       - online
+  total_timesteps:
+    values: 
+      - 5.7e9
   train_seed:
     values: 
       - 42
@@ -18,12 +21,17 @@ parameters:
       - 44
       - 45
       - 46
+      - 47
+      - 48
+      - 49
+      - 50
+      - 51
   benchmark_id:
     values:
       - high-3m
   group:
     values:
-      - high-13-sfl-v1
+      - high-13-ncc-v1
 program: training/train_meta_task_sfl.py
 project: minigrid
 
