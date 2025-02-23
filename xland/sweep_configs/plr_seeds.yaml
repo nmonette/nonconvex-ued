@@ -11,6 +11,9 @@ parameters:
   mode:
     values:
       - online
+  total_timesteps:
+    values: 
+      - 5.7e9
   train_seed:
     values: 
       - 42
@@ -18,6 +21,11 @@ parameters:
       - 44
       - 45
       - 46
+      - 47
+      - 48
+      - 49
+      - 50
+      - 51
   benchmark_id:
     values:
       - high-3m
@@ -28,6 +36,6 @@ parameters:
     values:
       - high-13-plr-v1
 program: training/train_meta_task_ued.py
-project: xminigrid
+project: minigrid
 
 

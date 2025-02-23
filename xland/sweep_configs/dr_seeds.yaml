@@ -17,15 +17,23 @@ parameters:
   group:
     values:
       - high-13-dr-v1
+  total_timesteps:
+    values: 
+      - 5.7e9
   train_seed:
-    values:
+    values: 
       - 42
       - 43
       - 44
       - 45
       - 46
+      - 47
+      - 48
+      - 49
+      - 50
+      - 51
   mode:
     values:
       - online
 program: training/train_meta_task.py
-project: xminigrid
+project: minigrid
