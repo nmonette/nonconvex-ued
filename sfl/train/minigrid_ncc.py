@@ -208,6 +208,11 @@ def main(config):
         log_dict.update({f"return/{name}": ret for name, ret in zip(config["EVAL_LEVELS"], returns)})
         log_dict.update({"return/mean": returns.mean()})
         log_dict.update({"eval_ep_lengths/mean": stats['eval_ep_lengths'].mean()})
+
+        log_dict.update({
+            "meta_entropy": metrics["meta_entropy"].mean(),
+            "meta_loss": metrics["meta_loss"].mean()
+        })
         
         # level sampler
         log_dict.update(train_state_info["log"])
@@ -227,6 +232,7 @@ def main(config):
             log_dict.update({f"animations/{level_name}": wandb.Video(frames, fps=4)})
         
         wandb.log(log_dict)
+
 
     # Setup the environment
     env = Maze(max_height=13, max_width=13, agent_view_size=config["AGENT_VIEW_SIZE"], normalize_obs=True)
@@ -321,17 +327,10 @@ def main(config):
         network = ActorCritic(env.action_space(env_params).n)
         network_params = network.init(rng, init_x, ActorCritic.initialize_carry((config["NUM_ENVS"],)))
 
-        if config["OPTIMISTIC"]:
-            tx = optax.chain(
+        tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 ti_ada(vy0 = jnp.zeros(config["PLR_PARAMS"]["capacity"]), eta=linear_schedule),
-                optax.scale_by_optimistic_gradient()
-            )
-        else:
-            tx = optax.chain(
-                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                ti_ada(vy0 = jnp.zeros(config["PLR_PARAMS"]["capacity"]), eta=linear_schedule),
-            )
+        )
         rng, _rng = jax.random.split(rng)
         init_levels = jax.vmap(sample_random_level)(jax.random.split(_rng, config["PLR_PARAMS"]["capacity"]))
         sampler = level_sampler.initialize(init_levels, {"max_return": jnp.full(config["PLR_PARAMS"]["capacity"], -jnp.inf)})
@@ -346,7 +345,7 @@ def main(config):
 
         rng, train_state, xhat, prev_grad, y_opt_state = carry
 
-        new_score = projection_simplex_truncated(xhat + prev_grad, config["META_TRUNC"]) if config["META_OPTIMISTIC"] else xhat
+        new_score = xhat # projection_simplex_truncated(xhat + prev_grad, config["META_TRUNC"]) if config["META_OPTIMISTIC"] else xhat
         sampler = {**train_state.sampler, "scores": new_score}
         # Collect trajectories on replay levels
         rng, rng_levels, rng_reset = jax.random.split(rng, 3)
@@ -394,14 +393,20 @@ def main(config):
         new_sampler = replace_fn(_rng, train_state, scores)
         sampler = {**new_sampler, "scores": new_score}
 
-        grad, y_opt_state = y_ti_ada.update(new_sampler["scores"], y_opt_state)
-        xhat = projection_simplex_truncated(xhat + grad, config["META_TRUNC"])
+        # grad, y_opt_state = y_ti_ada.update(new_sampler["scores"], y_opt_state)
+        # xhat = projection_simplex_truncated(xhat + grad, config["META_TRUNC"])
+
+        def grad_fn(y):
+            return y.T @ new_sampler["scores"] - config["META_REG"] * y.T @ jnp.log(y + 1e-6) # jnp.square(optax.safe_norm(x, 0, 2))
+        
+        grad, y_opt_state = y_ti_ada.update(jax.grad(grad_fn)(xhat), y_opt_state)
+        xhat = projection_simplex_truncated(xhat + grad, config["META_TRUNC"]) 
 
         metrics = {
             "losses": jax.tree_map(lambda x: x.mean(), losses),
             "mean_num_blocks": levels.wall_map.sum() / config["NUM_ENVS"],
             "meta_entropy": -jnp.dot(sampler["scores"], jnp.log(sampler["scores"] + 1e-6)),
-            "meta_loss": new_sampler["scores"].T @ new_score
+            "meta_loss": new_sampler["scores"].T @ new_score -jnp.dot(sampler["scores"], jnp.log(sampler["scores"] + 1e-6))
         }
         
         train_state = train_state.replace(
@@ -506,7 +511,8 @@ def main(config):
     y_ti_ada = scale_y_by_ti_ada(eta=config["META_LR"])
     y_opt_state = y_ti_ada.init(jnp.zeros_like(train_state.sampler["scores"]))
         
-    xhat = grad = jnp.zeros_like(train_state.sampler["scores"])
+    grad = jnp.zeros_like(train_state.sampler["scores"])
+    xhat = jnp.full_like(grad, 1 / len(grad))
     runner_state = (rng_train, train_state, xhat, grad, y_opt_state)
     
     # And run the train_eval_sep function for the specified number of updates

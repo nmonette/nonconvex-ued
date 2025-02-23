@@ -333,17 +333,10 @@ def main(config):
         network = ActorCritic(env.action_space(env_params).n)
         network_params = network.init(rng, init_x, ActorCritic.initialize_carry((config["NUM_ENVS"],)))
 
-        if config["OPTIMISTIC"]:
-            tx = optax.chain(
+        tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 ti_ada(vy0 = jnp.zeros(config["PLR_PARAMS"]["capacity"]), eta=linear_schedule),
-                optax.scale_by_optimistic_gradient()
-            )
-        else:
-            tx = optax.chain(
-                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                ti_ada(vy0 = jnp.zeros(config["PLR_PARAMS"]["capacity"]), eta=linear_schedule),
-            )
+        )
         rng, _rng = jax.random.split(rng)
         init_levels = jax.vmap(sample_random_level)(jax.random.split(_rng, config["PLR_PARAMS"]["capacity"]))
         sampler = level_sampler.initialize(init_levels, {"max_return": jnp.full(config["PLR_PARAMS"]["capacity"], -jnp.inf)})
@@ -358,7 +351,7 @@ def main(config):
 
         rng, train_state, xhat, prev_grad, y_opt_state = carry
 
-        new_score = projection_simplex_truncated(xhat + prev_grad, config["META_TRUNC"]) if config["META_OPTIMISTIC"] else xhat
+        new_score = xhat # projection_simplex_truncated(xhat + prev_grad, config["META_TRUNC"]) if config["META_OPTIMISTIC"] else xhat
         sampler = {**train_state.sampler, "scores": new_score}
         # Collect trajectories on replay levels
         rng, rng_levels, rng_reset = jax.random.split(rng, 3)
@@ -406,14 +399,16 @@ def main(config):
         new_sampler = replace_fn(_rng, train_state, scores)
         sampler = {**new_sampler, "scores": new_score}
 
-        grad, y_opt_state = y_ti_ada.update(new_sampler["scores"], y_opt_state)
+        grad_fn = jax.grad(lambda y: y.T @ new_sampler["scores"] - config["META_REG"] * jnp.log(y + 1e-6).T @ y)
+        grad = grad_fn(new_score)
+        grad, y_opt_state = y_ti_ada.update(grad, y_opt_state)
         xhat = projection_simplex_truncated(xhat + grad, config["META_TRUNC"])
 
         metrics = {
             "losses": jax.tree_map(lambda x: x.mean(), losses),
             "mean_num_blocks": levels.wall_map.sum() / config["NUM_ENVS"],
             "meta_entropy": -jnp.dot(sampler["scores"], jnp.log(sampler["scores"] + 1e-6)),
-            "meta_loss": new_sampler["scores"].T @ new_score
+            "meta_loss": (lambda y: y.T @ new_sampler["scores"] - config["META_REG"] * jnp.log(y + 1e-6).T @ y)(new_score)
         }
         
         train_state = train_state.replace(
@@ -518,7 +513,8 @@ def main(config):
     y_ti_ada = scale_y_by_ti_ada(eta=config["META_LR"])
     y_opt_state = y_ti_ada.init(jnp.zeros_like(train_state.sampler["scores"]))
         
-    xhat = grad = jnp.zeros_like(train_state.sampler["scores"])
+    grad = jnp.zeros_like(train_state.sampler["scores"])
+    xhat = jnp.full_like(grad, 1 / len(grad))
     runner_state = (rng_train, train_state, xhat, grad, y_opt_state)
     
     # And run the train_eval_sep function for the specified number of updates

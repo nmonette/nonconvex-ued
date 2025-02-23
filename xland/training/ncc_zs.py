@@ -32,7 +32,7 @@ from xminigrid.wrappers import GymAutoResetWrapper
 
 from jaxued.level_sampler import LevelSampler as BaseLevelSampler
 from jaxued.utils import compute_max_returns, max_mc, positive_value_loss
-from ncc_utils import scale_y_by_ti_ada, ScaleByTiAdaState, ti_ada, projection_simplex_truncated, tree_l2_norm
+from ncc_utils import scale_y_by_ti_ada, ScaleByTiAdaState, ti_ada, projection_simplex_truncated
 
 # this will be default in new jax versions anyway
 jax.config.update("jax_threefry_partitionable", True)
@@ -54,24 +54,6 @@ class LevelSampler(BaseLevelSampler):
             sampler["levels_extra"] = level_extras
         return sampler
 
-def mini_batch_vmap(f, num_mini_batches):
-    """
-    Execute a function in sequential, vmapped mini-batches.
-    Enables execution of batches too large to fit in memory.
-    """
-
-    def mapped_fn(*args):
-        def batched_fn(_, x):
-            return None, jax.vmap(f)(*x)
-
-        mini_batched_args = jax.tree_util.tree_map(
-            lambda x: x.reshape((num_mini_batches, -1, *x.shape[1:])), args
-        )
-        _, ret = jax.lax.scan(batched_fn, None, mini_batched_args)
-        return jax.tree_map(lambda x: x.reshape((-1, *x.shape[2:])), ret)
-
-    return mapped_fn
-
 @dataclass 
 class PrioritizationParams:
     temperature: float = 1.0
@@ -86,10 +68,10 @@ class TrainConfig:
     benchmark_id: str = "high-3m"
     img_obs: bool = False
     # agent
-    optimistic: bool = True
-    meta_optimistic: bool = True
+    meta_optimistic: bool = False
     meta_trunc: float = 1e-5
     meta_lr: float = 1e-3
+    meta_reg: float = 0.0
 
     action_emb_dim: int = 16
     rnn_hidden_dim: int = 1024
@@ -102,7 +84,7 @@ class TrainConfig:
     num_steps_per_update: int = 32
     update_epochs: int = 1
     num_minibatches: int = 16
-    total_timesteps: int = 1e10
+    total_timesteps: int = 5.7e9
     learning_rate: float = 0.0001
     clip_eps: float = 0.2
     gamma: float = 0.99
@@ -113,10 +95,13 @@ class TrainConfig:
     #eval
     eval_num_envs: int = 512
     eval_num_episodes: int = 10
+    num_eval_steps: int = 500
     eval_seed: int = 42
     train_seed: int = 42
     checkpoint_path: Optional[str] = "checkpoints"
+
     #ued
+    static_buffer: bool = False
     exploratory_grad_updates: bool = True
     ued_score_function: str = "MaxMC"
     replay_prob: float = 0.95
@@ -166,6 +151,67 @@ class Transition(struct.PyTreeNode):
     # for rnn policy
     prev_action: jax.Array
     prev_reward: jax.Array
+
+def rollout_nsteps_score(
+    rng: jax.Array,
+    env: Environment,
+    env_params: EnvParams,
+    train_state: TrainState,
+    init_hstate: jax.Array,
+    num_steps: int = 500
+):
+    """ Rollout for `num_steps` environment steps """
+
+    def _env_step(carry, unused):
+        rng, prev_timestep, prev_action, prev_reward, hstate = carry
+
+        rng, _rng = jax.random.split(rng)
+        dist, value, hstate = train_state.apply_fn(
+            train_state.params,
+            {
+                "observation": prev_timestep.observation[None, None, ...],
+                "prev_action": prev_action[None, None, ...],
+                "prev_reward": prev_reward[None, None, ...],
+            },
+            hstate,
+        )
+        action, log_prob = dist.sample_and_log_prob(seed=_rng)
+        action, value, log_prob = action.squeeze(), value.squeeze(1), log_prob.squeeze(1)
+        timestep = env.step(env_params, prev_timestep, action)
+        carry = (rng, timestep, action, timestep.reward, hstate)
+        return carry, Transition(
+            done=jnp.zeros_like(timestep.last()),
+            ep_done=timestep.last(),
+            action=action,
+            value=value,
+            reward=timestep.reward,
+            log_prob=log_prob,
+            obs=prev_timestep.observation,
+            prev_action=prev_action,
+            prev_reward=prev_reward,
+        )
+
+    timestep = env.reset(env_params, rng)
+    prev_action = jnp.asarray(0)
+    prev_reward = jnp.asarray(0)
+    init_carry = (rng, timestep, prev_action, prev_reward, init_hstate)
+
+    final_carry, transitions = jax.lax.scan(_env_step, init_carry, None, length=num_steps)
+
+     # CALCULATE ADVANTAGE
+    rng, timestep, prev_action, prev_reward, hstate = final_carry
+    # calculate value of the last step for bootstrapping
+    _, last_val, _ = train_state.apply_fn(
+        train_state.params,
+        {
+                "observation": timestep.observation[None, None, ...],
+                "prev_action": prev_action[None, None, ...],
+                "prev_reward": prev_reward[None, None, ...],
+        },
+        hstate,
+    )
+
+    return transitions, last_val
     
 class UEDTrajBatch(struct.PyTreeNode):
     # for calculating UED score
@@ -176,9 +222,9 @@ class UEDTrajBatch(struct.PyTreeNode):
 
 def compute_score(score_fn, dones, values, max_returns, advantages):
     if score_fn == "MaxMC":
-        return max_mc(dones, values, max_returns)
+        return max_mc(dones, values, max_returns, 0.0)
     elif score_fn == "pvl":
-        return positive_value_loss(dones, advantages)
+        return positive_value_loss(dones, advantages, 0.0)
     else:
         raise ValueError(f"Unknown score function: {score_fn}")
 
@@ -335,157 +381,27 @@ def make_train(
             sampler, _ = level_sampler.insert_batch(sampler, levels, scores_by_level, {"max_return": max_returns_by_level})
             return sampler
 
-        network = ActorCriticRNN(
-            num_actions=env.num_actions(env_params),
-            action_emb_dim=config.action_emb_dim,
-            rnn_hidden_dim=config.rnn_hidden_dim,
-            rnn_num_layers=config.rnn_num_layers,
-            head_hidden_dim=config.head_hidden_dim,
-            img_obs=config.img_obs,
-        )
-
-        NUM_PARALLEL_ROLLOUTS = 5
         def learnability_fn(rng, rulesets, num_envs, train_state):
 
-            def score_fn(rng, ruleset):
+            eval_env_params = env_params.replace(ruleset=rulesets)
 
-                meta_env_params = env_params.replace(ruleset=ruleset)
+            eval_reset_rng = jax.random.split(rng, num=num_envs)
 
-                rng, _rng = jax.random.split(rng)
-                reset_rng = jax.random.split(_rng, num=NUM_PARALLEL_ROLLOUTS)
-                timestep = jax.vmap(env.reset, in_axes=(0, 0))(meta_env_params, reset_rng)
-                prev_action = jnp.zeros(NUM_PARALLEL_ROLLOUTS, dtype=jnp.int32)
-                prev_reward = jnp.zeros(NUM_PARALLEL_ROLLOUTS)
-
-                outcomes = jnp.zeros((NUM_PARALLEL_ROLLOUTS, 2))
-
-                init_hstate = network.initialize_carry(batch_size=NUM_PARALLEL_ROLLOUTS)
-                runner_state = (rng, timestep, prev_action, prev_reward, outcomes, init_hstate)
-
-                def _env_step(runner_state, _):
-                    rng, prev_timestep, prev_action, prev_reward, outcomes, prev_hstate = runner_state
-
-                    # SELECT ACTION
-                    rng, _rng = jax.random.split(rng)
-                    dist, value, hstate = train_state.apply_fn(
-                        train_state.params,
-                        {
-                            # [batch_size, seq_len=1, ...]
-                            "observation": prev_timestep.observation[:, None],
-                            "prev_action": prev_action[:, None],
-                            "prev_reward": prev_reward[:, None],
-                        },
-                        prev_hstate,
-                    )
-                    action, log_prob = dist.sample_and_log_prob(seed=_rng)
-                    # squeeze seq_len where possible
-                    action, value, log_prob = action.squeeze(1), value.squeeze(1), log_prob.squeeze(1)
-
-                    # STEP ENV
-                    timestep = jax.vmap(env.step, in_axes=0)(meta_env_params, prev_timestep, action)
-                    success = timestep.discount == 0.0
-                    outcomes = outcomes.at[:, 0].add(jnp.where(timestep.last(), 1, 0))
-                    outcomes = outcomes.at[:, 1].add(jnp.where(success, 1, 0))
-                    
-                    transition = Transition(
-                        # ATTENTION: done is always false, as we optimize for entire meta-rollout
-                        done=jnp.zeros_like(timestep.last()),
-                        ep_done=timestep.last(),
-                        action=action,
-                        value=value,
-                        reward=timestep.reward,
-                        log_prob=log_prob,
-                        obs=prev_timestep.observation,
-                        prev_action=prev_action,
-                        prev_reward=prev_reward,
-                    )
-                    runner_state = (rng, timestep, action, timestep.reward, outcomes, hstate)
-                    return runner_state, transition
-
-                # transitions: [seq_len, batch_size, ...]
-                runner_state, transitions = jax.lax.scan(_env_step, runner_state, None, config.num_steps_per_update)
-
-                # CALCULATE ADVANTAGE
-                rng, timestep, prev_action, prev_reward, outcomes, hstate = runner_state
-                # calculate value of the last step for bootstrapping
-                _, last_val, _ = train_state.apply_fn(
-                    train_state.params,
-                    {
-                        "observation": timestep.observation[:, None],
-                        "prev_action": prev_action[:, None],
-                        "prev_reward": prev_reward[:, None],
-                    },
-                    hstate,
-                )
-                advantages, targets = calculate_gae(transitions, last_val.squeeze(1), config.gamma, config.gae_lambda)
-
-                # NORMALIZE ADVANTAGES
-                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-                # [batch_size, seq_len, ...], as our model assumes
-                init_hstate, transitions, advantages, targets = jtu.tree_map(lambda x: x.swapaxes(0, 1), (init_hstate, transitions, advantages, targets))
-
-                def _loss_fn(params):
-                    # RERUN NETWORK
-                    dist, value, _ = train_state.apply_fn(
-                        params,
-                        {
-                            # [batch_size, seq_len, ...]
-                            "observation": transitions.obs,
-                            "prev_action": transitions.prev_action,
-                            "prev_reward": transitions.prev_reward,
-                        },
-                        network.initialize_carry(batch_size=NUM_PARALLEL_ROLLOUTS),
-                    )
-                    log_prob = dist.log_prob(transitions.action)
-
-                    # CALCULATE VALUE LOSS
-                    value_pred_clipped = transitions.value + (value - transitions.value).clip(-config.clip_eps, config.clip_eps)
-                    value_loss = jnp.square(value - targets)
-                    value_loss_clipped = jnp.square(value_pred_clipped - targets)
-                    value_loss = 0.5 * jnp.maximum(value_loss, value_loss_clipped).mean()
-                    # TODO: ablate this!
-                    # value_loss = jnp.square(value - targets).mean()
-
-                    # CALCULATE ACTOR LOSS
-                    ratio = jnp.exp(log_prob - transitions.log_prob)
-                    actor_loss1 = advantages * ratio
-                    actor_loss2 = advantages * jnp.clip(ratio, 1.0 -config. clip_eps, 1.0 + config.clip_eps)
-                    actor_loss = -jnp.minimum(actor_loss1, actor_loss2).mean()
-                    entropy = dist.entropy().mean()
-
-                    total_loss = actor_loss + config.vf_coef * value_loss - config.ent_coef * entropy
-                    return total_loss, (value_loss, actor_loss, entropy)
-
-                _, grads = jax.value_and_grad(_loss_fn, has_aux=True)(train_state.params)
-                grads = jax.lax.pmean(grads, axis_name="devices")
-
-                grad_norm = tree_l2_norm(grads)
-                return grad_norm
-
-
-            rulesets = jax.tree_util.tree_map(
-                lambda x: jnp.repeat(x, NUM_PARALLEL_ROLLOUTS, axis=0).reshape(x.shape[0], NUM_PARALLEL_ROLLOUTS, *x.shape[1:]), rulesets
+            eval_trajs, last_vals = jax.vmap(rollout_nsteps_score, in_axes=(0, None, 0, None, None, None))(
+                eval_reset_rng,
+                env,
+                eval_env_params,
+                train_state,
+                jnp.zeros((1, config.rnn_num_layers, config.rnn_hidden_dim)),
+                config.num_eval_steps
             )
 
-            print(jax.tree_util.tree_map(jnp.shape, rulesets))
+            transitions = jax.tree_util.tree_map(lambda x: x.swapaxes(0, 1).squeeze(), eval_trajs)
+            advantages, targets = calculate_gae(transitions, last_vals.squeeze(), config.gamma, config.gae_lambda)
+            max_returns = compute_max_returns(transitions.ep_done, transitions.reward)
+            scores = compute_score(config.ued_score_function, transitions.ep_done, transitions.value, max_returns, advantages)
 
-            # def maxed_score_fn(rng, rulesets):
-
-            #     _rng = jax.random.split(rng, num=NUM_PARALLEL_ROLLOUTS)
-
-            #     rulesets = jax.tree_util.tree_map(
-            #         lambda x: x.reshape()
-            #     )
-
-            #     grad_norms = jax.vmap(score_fn)(_rng, rulesets)
-
-            #     return grad_norms.max()
-
-            rng, _rng = jax.random.split(rng)
-            scores = mini_batch_vmap(score_fn, 8)(jax.random.split(_rng, num=num_envs), rulesets)
-
-            return scores, jnp.full_like(scores, 1.0)
+            return scores, max_returns
 
         def replace_fn(rng, train_state, old_level_scores):
             # NOTE: scores here are the actual UED scores, NOT the probabilities induced by the projection
@@ -517,31 +433,10 @@ def make_train(
 
             # INIT ENV
             rng, _rng1, _rng2, _rng3 = jax.random.split(rng, num=4)
-
-            # OPTIMISTIC UPDATE FOR Y
-            # Update the level sampler
-
-            new_score = projection_simplex_truncated(xhat + prev_grad, config.meta_trunc)
-
-            levels = train_state.sampler["levels"]
-            rng, _rng = jax.random.split(rng)
-            scores, _ = learnability_fn(_rng, levels, config.buffer_capacity, train_state)
-
-            rng, _rng = jax.random.split(rng)
-            new_sampler = replace_fn(_rng, train_state, scores)
-            sampler = {**new_sampler, "scores": new_score}
-
-            grad, y_opt_state = y_ti_ada.update(new_sampler["scores"], y_opt_state)
-            xhat = projection_simplex_truncated(xhat + grad, config.meta_trunc)
-
-            train_state = train_state.replace(
-                opt_state = jax.tree_util.tree_map(
-                    lambda x: x if type(x) is not ScaleByTiAdaState else x.replace(vy = y_opt_state.vy), train_state.opt_state
-                ),
-                sampler = sampler
-            )
             
             # sample rulesets for this meta update
+            branch = level_sampler.sample_replay_decision(train_state.sampler, _rng1).astype(int)
+            new_score = projection_simplex_truncated(xhat + prev_grad, config.meta_trunc) if config.meta_optimistic else xhat
             sampler = {**train_state.sampler, "scores": new_score}
             rng, _rng = jax.random.split(rng)
             sampler, (level_idxs, rulesets) = level_sampler.sample_replay_levels(sampler, _rng, config.num_envs_per_device)
@@ -675,6 +570,30 @@ def make_train(
             rng, train_state = runner_state[:2]
             # WARN: do not forget to get updated params
             
+            # Update the level sampler
+            levels = sampler["levels"]
+            rng, _rng = jax.random.split(rng)
+            scores, _ = learnability_fn(_rng, levels, config.buffer_capacity, train_state)
+
+            rng, _rng = jax.random.split(rng)
+            # new_sampler = jax.lax.cond(
+            #     update_idx % config.replace_iters == 0, replace_fn, lambda r, t, s: train_state.sampler, _rng, train_state, scores
+            # )
+            new_sampler = {**train_state.sampler, "scores": scores} if config.static_buffer else replace_fn(_rng, train_state, scores)
+            sampler = {**new_sampler, "scores": new_score}
+
+            y_fn = lambda y: y.T @ new_sampler["scores"] - config.meta_reg * y.T @ jnp.log(1e-6 + y)
+            grad_fn = jax.grad(y_fn)
+            grad, y_opt_state = y_ti_ada.update(grad_fn(xhat), y_opt_state)
+            xhat = projection_simplex_truncated(xhat + grad, config.meta_trunc)
+
+            train_state = train_state.replace(
+                opt_state = jax.tree_util.tree_map(
+                    lambda x: x if type(x) is not ScaleByTiAdaState else x.replace(vy = y_opt_state.vy), train_state.opt_state
+                ),
+                sampler = sampler
+            )
+            
             outcomes = runner_state[-2]
             success_rate = outcomes.at[:, 1].get() / outcomes.at[:, 0].get()
             # EVALUATE AGENT
@@ -704,7 +623,6 @@ def make_train(
                 lambda *_: None,
             )
 
-
             # averaging over inner updates, adding evaluation metrics
             loss_info = jtu.tree_map(lambda x: x.mean(-1), loss_info)
             loss_info.update(
@@ -715,6 +633,8 @@ def make_train(
                     "eval/success_rate_mean": jnp.mean(eval_stats.success/eval_stats.episodes),
                     "eval/lengths_20percentile": jnp.percentile(eval_stats.length, q=20),
                     "eval/returns_20percentile": jnp.percentile(eval_stats.reward, q=20),
+                    "adv_loss": y_fn(xhat),
+                    "adv_entropy": -xhat.T @ jnp.log(1e-6 + xhat),
                     "ruleset_mean_num_rules": ruleset_mean_num_rules,
                     "outcomes": success_rate,
                     "num_env_steps": update_idx * config.num_inner_updates * config.num_steps_per_update * config.num_envs,
@@ -738,7 +658,8 @@ def make_train(
         ruleset_rng = jax.random.split(_rng, num=config.buffer_capacity)
         levels = jax.vmap(benchmark.sample_ruleset)(ruleset_rng)
         sampler = level_sampler.initialize(levels, {"max_return": jnp.full(config.buffer_capacity, -jnp.inf)})
-        xhat = sampler["scores"]
+        # xhat = sampler["scores"]
+        xhat = jnp.full_like(sampler["scores"], 1 / config.buffer_capacity)
         grad = jnp.zeros_like(xhat)
         meta_state = (rng, train_state.replace(sampler = sampler), xhat, grad, y_opt_state)
         meta_state, loss_info = jax.lax.scan(_meta_step, meta_state, jnp.arange(config.num_meta_updates), config.num_meta_updates)
