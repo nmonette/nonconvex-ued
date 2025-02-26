@@ -26,8 +26,8 @@ parameters:
   benchmark_id:
     values:
       - high-3m
-name: xland-ncc
-program: training/train_meta_task_ncc.py
+name: xland-ncc-sim
+program: training/ncc_sim.py
 project: minigrid
 
 
